@@ -240,11 +240,11 @@ def main():
             if i not in processed:
                 break
         processed.append(i)
-        print("{}th iteration choose {} {}".format(j, i, w[i]))
+        print("{}th {} iteration choose {} {}".format(j, j/n, i, w[i]))
         d = -w[i] * model.fisher_emp.inv[:, i] / model.fisher_emp.inv[i, i]
 
         w += d
-        assert w[i] == 0.0
+        torch.isclose(w[i], torch.tensor([0.0]))
         assign_flatten_w_to_model(model, w)
         test(model, loaders["test"], criterion, args.device)
 
