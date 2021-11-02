@@ -221,6 +221,7 @@ def main():
 
     model.load_state_dict(
         torch.load("{}/best-{}-{}".format(args.log, args.model, args.dataset)))
+    model.to(args.device)
     print("Final Acc: {:.4f}".format(
         test(model, loaders["test"], criterion, args.device)))
 
@@ -242,6 +243,8 @@ def main():
         processed.append(i)
         print("{}th {} iteration choose {} {}".format(j, j/n, i, w[i]))
         d = -w[i] * model.fisher_emp.inv[:, i] / model.fisher_emp.inv[i, i]
+        # first i=0 => w'=w+d' => w'[0]==0
+        # second i=1 => w''=w'+d'' => w''[1]=0, d''[0]!=0 w''[0]!=0
 
         w += d
         torch.isclose(w[i], torch.tensor([0.0]))
