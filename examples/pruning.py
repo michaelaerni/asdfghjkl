@@ -58,6 +58,7 @@ def parse_args():
                         default="full",
                         choices=["full", "layer_wise", "kron", "unit_wise"])
     parser.add_argument("--sparsity", type=float, default=1.0)
+    parser.add_argument("--damping", type=float, default=1e-2)
     parser.add_argument("--n_recompute", type=int, default=10)
     parser.add_argument("--n_recompute_samples", type=int, default=4096)
     parser.add_argument("--test_intvl", type=float, default=0.05)
@@ -433,6 +434,7 @@ class OptimalBrainSurgeon(object):
               sparsity,
               fisher_type,
               fisher_shape,
+              damping = 1e-2,
               n_recompute=1,
               n_recompute_samples=4096,
               cb=None):
@@ -443,7 +445,7 @@ class OptimalBrainSurgeon(object):
         #fisher = getattr(self.model, self.fisher_type)
 
         init_n_zero = self.n_zero
-        target_n_zero = self.n * sparsity
+        target_n_zero = int(self.n * sparsity)
 
         if n_recompute == -1:
             n_recompute = target_n_zero - init_n_zero - 1
@@ -456,7 +458,7 @@ class OptimalBrainSurgeon(object):
             n_pruned = int(schedule(i)) - self.n_zero
 
             fisher = self._calc_fisher(loader, fisher_type, fisher_shape,
-                                       n_recompute_samples)
+                                       n_recompute_samples, damping)
 
             scores = self.parameters.pow(2) / torch.diagonal(fisher.inv)
             scores -= scores.max() + 1
@@ -522,8 +524,8 @@ def one_shot_pruning(model, loaders, criterion, args):
 
     _cb(0, model)
     obs.prune(loaders["train"], args.sparsity, args.fisher_type,
-              args.fisher_shape, args.n_recompute, args.n_recompute_samples,
-              _cb)
+              args.fisher_shape, args.damping, args.n_recompute,
+              args.n_recompute_samples, _cb)
 
 
 def main():
