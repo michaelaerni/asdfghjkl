@@ -58,7 +58,7 @@ def parse_args():
                         default="full",
                         choices=["full", "layer_wise", "kron", "unit_wise"])
     parser.add_argument("--sparsity", type=float, default=1.0)
-    parser.add_argument("--damping", type=float, default=1e-2)
+    parser.add_argument("--damping", type=float, default=1e-3)
     parser.add_argument("--n_recompute", type=int, default=10)
     parser.add_argument("--n_recompute_samples", type=int, default=4096)
     parser.add_argument("--test_intvl", type=float, default=0.05)
@@ -434,7 +434,7 @@ class OptimalBrainSurgeon(object):
               sparsity,
               fisher_type,
               fisher_shape,
-              damping = 1e-2,
+              damping=1e-3,
               n_recompute=1,
               n_recompute_samples=4096,
               cb=None):
@@ -448,8 +448,8 @@ class OptimalBrainSurgeon(object):
         target_n_zero = int(self.n * sparsity)
 
         if n_recompute == -1:
-            n_recompute = target_n_zero - init_n_zero - 1
-            schedule = lambda i: 1
+            n_recompute = target_n_zero - init_n_zero
+            schedule = lambda i: self.n_zero + 1
         else:
             schedule = lambda i: polynomial_schedule(
                 init_n_zero, target_n_zero, i, n_recompute)
