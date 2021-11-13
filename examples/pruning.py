@@ -1,6 +1,8 @@
 import argparse
 import copy
 #from functools import reduce
+import logging
+
 
 import matplotlib.pyplot as plt
 import torch
@@ -8,6 +10,7 @@ from torch import nn
 #from torch.nn.utils import prune
 import torch.nn.functional as F
 import torchvision
+import wandb
 
 import asdfghjkl as asdl
 from asdfghjkl import fisher_for_cross_entropy
@@ -16,7 +19,7 @@ from asdfghjkl import SHAPE_FULL, SHAPE_LAYER_WISE, SHAPE_KRON, SHAPE_DIAG
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="prunning")
+    parser = argparse.ArgumentParser(description="prnning")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--log", type=str, default="./.log")
@@ -31,7 +34,7 @@ def parse_args():
                         default="MNIST",
                         choices=["MNIST", "CIFAR10"])
     parser.add_argument("--data_dir", type=str, default="./.data")
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--shuffle", dest="shuffle", action="store_true")
     parser.add_argument("--no-shuffle", dest="shuffle", action="store_false")
     parser.set_defaults(shuffle=True)
@@ -40,9 +43,35 @@ def parse_args():
     parser.add_argument("--no-pretrain", dest="pretrain", action="store_false")
     parser.set_defaults(pretrain=True)
     parser.add_argument("--e", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-1)
 
-    return parser.parse_args()
+    parser.add_argument("--pruning_strategy", type=str, default="oneshot", choices=["oneshot", "gradual"])
+    parser.add_argument("--fisher_type", type=str, default="fisher_emp", choices=["fisher_exact","fisher_mc","fisher_emp"])
+    parser.add_argument("--fisher_shape", type=str, default="full", choices=["full","layer_wise","kron","unit_wise"])
+    parser.add_argument("--sparsity", type=float, default=1.0)
+    parser.add_argument("--n_recompute", type=int, default=10)
+    parser.add_argument("--n_recompute_samples", type=int, default=4096)
+
+    args = parser.parse_args()
+
+    args.model_dir = f"{args.log}/{args.model}-{args.dataset}"
+    args.log = f"{args.log}/{args.model}-{args.dataset}/"
+               f"{args.pruning_strategy}/{args.fisher_shape}/"
+               f"{args.n_recompute}-{args.n_recompute_samples}"
+    Path(args.log).mkdir(parents=True, exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[
+            logging.FileHandler(f"{args.log}/log"),
+            logging.StreamHandler()
+        ]
+    )
+
+    wandb.init(project="pruning")
+    wandb.run.name = args.log
+
+    return args
 
 
 def calc_moments(loader):
@@ -59,7 +88,7 @@ def calc_moments(loader):
         sq = x2 if sq is None else sq + x2
     mean = s / n
     std = ((sq - n * mean.pow(2)) / (n - 1)).pow(0.5)
-    print(f"n: {n/h/w}, mean: {mean}, std: {std}")
+    logging.info(f"n: {n/h/w}, mean: {mean}, std: {std}")
     return n / h / w, mean, std
 
 
@@ -204,7 +233,7 @@ def train(model, loader, optimizer, criterion, device="cpu"):
     loss = loss / len(loader.dataset)
     acc = corrects.double() / len(loader.dataset)
 
-    print("Train Loss: {:.4f} Acc: {:.4f}".format(loss, acc))
+    logging.info(f"Train Loss: {loss:.4f} Acc: {acc:.4f}")
 
 
 def test(model, loader, criterion, device="cpu"):
@@ -227,7 +256,7 @@ def test(model, loader, criterion, device="cpu"):
     loss = loss / len(loader.dataset)
     acc = corrects.double() / len(loader.dataset)
 
-    print("Test Loss: {:.4f} Acc: {:.4f}".format(loss, acc))
+    logging.info(f"Test Loss: {loss:.4f} Acc: {acc:.4f}")
     return acc
 
 
@@ -235,14 +264,23 @@ def pretrain(model, loaders, opt, criterion, args):
     best_acc = 0.0
     best_model_metadata = copy.deepcopy(model.state_dict())
     for e in range(args.e):
-        print("Epoch {}/{}".format(e + 1, args.e))
+        logging.info(f"Epoch {e + 1}/{args.e}")
         train(model, loaders["train"], opt, criterion, args.device)
         acc = test(model, loaders["test"], criterion, args.device)
         if acc > best_acc:
             best_acc = acc
             best_model_metadata = copy.deepcopy(model.state_dict())
     torch.save(best_model_metadata,
-               "{}/best-{}-{}".format(args.log, args.model, args.dataset))
+               f"{args.model_dir}/best-{best_acc}")
+    torch.save(best_model_metadata,
+               f"{args.model_dir}/best")
+
+
+def polynomial_schedule(self, start, end, i, n):
+    scale = end - start
+    progress = min(i / n, 1.0)
+    remaining_progress = (1.0 - progress) ** 2
+    return end - scale * remaining_progress
 
 
 class Scope(object):
@@ -265,15 +303,13 @@ class Scope(object):
 
 
 class OptimalBrainSurgeon(object):
-    def __init__(self, model, scopes, fisher_shapes, fisher_type=FISHER_EMP):
+    def __init__(self, model, scopes):
         self.model = model
         self.scopes = scopes
-        self.fisher_shapes = fisher_shapes
-        self.fisher_type = fisher_type
         self.init_mask()
         self.n = len(self.parameters)
         self.n_zero = 0
-        print(self)
+        logging.info(self)
 
     ##### Parameter #####
     @property
@@ -297,6 +333,12 @@ class OptimalBrainSurgeon(object):
         head = 0
         for x in self.model.parameters():
             x.data = p[head:head + torch.numel(x)].reshape(x.shape)
+            head += torch.numel(x)
+
+    def parameters_iadd(self, p):
+        head = 0
+        for x in self.model.parameters():
+            x.data += p[head:head + torch.numel(x)].reshape(x.shape)
             head += torch.numel(x)
 
     ##### Mask #####
@@ -332,49 +374,90 @@ class OptimalBrainSurgeon(object):
             if v.has(index):
                 return v
 
-    ##### Prunning #####
-    def prune(self, loader):
-        fisher_for_cross_entropy(self.model,
-                                 fisher_type=self.fisher_type,
-                                 fisher_shapes=self.fisher_shapes,
-                                 data_loader=loader)
-        fisher = getattr(self.model, self.fisher_type)
 
+    ##### Fisher #####
+    def _calc_fisher(self, loader, fisher_type, fisher_shape, n_samples, damping=1e-3):
+        for inputs, targets in loader:
+            if len(inputs) > n_samples:
+                inputs = inputs[:n_samples]
+                targets = targets[:n_samples]
+            fisher_for_cross_entropy(self.model,
+                                     fisher_type=fisher_type,
+                                     fisher_shapes=[fisher_shape],
+                                     inputs=inputs,
+                                     targets=targets,
+                                     accumulate=True)
+            n_samples -= len(inputs)
+            if n_samples <= 0:
+                break
+        fisher = getattr(self.model, self.fisher_type)
         mask = self.mask
         fisher.data *= mask.reshape([1, -1]) * mask.reshape([-1, 1])
-        fisher.update_inv(1e-3)
+        fisher.update_inv(damping)
+        return fisher
 
-        scores = self.parameters.pow(2) / torch.diagonal(fisher.inv)
-        scores -= scores.max()
-        scores *= mask
 
-        _, indices = torch.sort(scores)
-        i = indices[0].item()
+    ##### Pruning #####
+    def pruning_direction(self, i, fisher):
+        parameters = self.parameters
+        d = -parameters[i] * fisher.inv[:, i] / fisher.inv[i, i]
+        d[i] = -parameters[i]
+        return d
 
+    def prune_one(self, i, fisher):
         scope = self.get_scope_by_index(i)
         self.get_mask_by_scope(scope).view(-1)[i - scope.l] = 0.0
         scope.n_zero += 1
 
-        parameters = self.parameters
-        d = -parameters[i] * fisher.inv[:, i] / fisher.inv[i, i]
-        d[i] = -parameters[i]
-        parameters += d
-        self.parameters = parameters
-
+        self.parameters_iadd(self.pruning_direction(k, fisher))
         self.n_zero += 1
 
         mask = self.mask
-        torch.isclose(mask[i], torch.tensor([0.0]))
+        torch.isclose(mask[k], torch.tensor([0.0]).to(mask.device))
         parameters = self.parameters
         torch.allclose(parameters.masked_select(mask < 1),
-                       torch.zeros(self.n_zero))
-        print(f"=============================================================="
-              f"\nPrunning No.{i} parameter in {scope.m_name}.{scope.p_name}"
-              f"\nscores: {scores[i]}\n{scores}"
-              f"\nd: \n{d}"
-              f"\nparameters: {parameters[i]}\n{parameters}"
-              f"\nmask: {mask[i]}\n{mask}"
-              f"\nsparsity: {self.n_zero}/{self.n}={self.n_zero/self.n}")
+                       torch.zeros(self.n_zero).to(mask.device))
+
+        logging.info(f"=============================================================="
+                     f"\nPruning No.{i} parameter in {scope.m_name}.{scope.p_name}"
+                     f"\nscores: {scores[i]}\n{scores}"
+                     f"\nd: \n{d}"
+                     f"\nparameters: {parameters[i]}\n{parameters}"
+                     f"\nmask: {mask[i]}\n{mask}"
+                     f"\nsparsity: {self.n_zero}/{self.n}={self.n_zero/self.n}")
+
+
+    def prune(self, loader, sparsity, fisher_type, fisher_shape, n_recompute=1, n_recompute_samples=4096, cb=None):
+        #fisher_for_cross_entropy(self.model,
+        #                         fisher_type=self.fisher_type,
+        #                         fisher_shapes=self.fisher_shapes,
+        #                         data_loader=loader)
+        #fisher = getattr(self.model, self.fisher_type)
+
+        init_n_zero = self.n_zero
+        target_n_zero = self.n * sparsity
+
+        if n_recompute == -1:
+            n_recompute = target_n_zero - init_n_zero - 1
+            schedule = lambda i: 1
+        else:
+            schedule = lambda i: polynomial_schedule(init_n_zero, target_n_zero, i, n_recompute)
+
+        for i in range(n_recompute+1):
+            n_pruned = schedule(i)
+
+            fisher = self._calc_fisher(loader, fisher_type, fisher_shape, n_recompute_samples)
+
+            scores = self.parameters.pow(2) / torch.diagonal(fisher.inv)
+            scores -= scores.max()
+            scores *= mask
+            _, indices = torch.sort(scores)
+
+            for j in range(n_pruned):
+                self.prune_one(indices[j].item(), fisher)
+                if cb is not None:
+                    cb(self.n_zero, self.model)
+
 
     @property
     def sparsity(self):
@@ -404,7 +487,7 @@ def list_model(module, prefix="", condition=lambda _: True):
     return modules
 
 
-def get_global_prunning_scope(model):
+def get_global_prnning_scope(model):
     modules = list_model(model, condition=lambda x: hasattr(x, "weight"))
     scopes = {}
     l = 0
@@ -417,26 +500,17 @@ def get_global_prunning_scope(model):
     #return {k: v for k, v in model.named_parameters()}
 
 
-def prunning(model, loaders, criterion, args):
+def one_shot_pruning(model, loaders, criterion, args):
     obs = OptimalBrainSurgeon(model,
-                              get_global_prunning_scope(model),
+                              get_global_prnning_scope(model),
                               fisher_shapes=[SHAPE_FULL])
-    x = []
-    y = []
-    for i in range(obs.n):
-        obs.prune(loaders["train"])
-        acc = test(model, loaders["test"], criterion, args.device)
-        x.append(obs.sparsity)
-        y.append(acc)
-        torch.save(copy.deepcopy(model.state_dict()),
-                   f"{args.log}/pruned-{args.model}-{args.dataset}-{i}-{acc}")
-    print(obs)
-    plt.plot(x, y, label=f"{args.model}-{args.dataset}")
-    plt.xlabel("sparsity")
-    plt.ylabel("acc")
-    plt.legend()
-    plt.savefig(f"{args.log}/pruned-{args.model}-{args.dataset}.svg")
-    #plt.show()
+    obs.prune(loaders["train"], args.sparsity,args.fisher_type, args.fisher_shape, args.n_recompute,args.n_recompute_samples)
+    #for i in range(obs.n):
+    #    obs.prune(loaders["train"])
+    #    acc = test(model, loaders["test"], criterion, args.device)
+    #    torch.save(copy.deepcopy(model.state_dict()),
+    #               f"{args.log}/{i}-{acc}")
+    logging.info(obs)
 
 
 def main():
@@ -455,11 +529,11 @@ def main():
     if not args.pretrain:
         pretrain(model, loaders, opt, criterion, args)
 
-    model.load_state_dict(
-        torch.load("{}/best-{}-{}".format(args.log, args.model, args.dataset)))
+    model.load_state_dict(torch.load(f"{args.model_dir}/best"))
     model.to(args.device)
 
-    prunning(model, loaders, criterion, args)
+    if args.pruning_strategy == "oneshot":
+        one_shot_pruning(model, loaders, criterion, args)
 
 
 if __name__ == "__main__":
