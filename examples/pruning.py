@@ -1,6 +1,9 @@
 import argparse
 import copy
 #from functools import reduce
+#from heapq import heapify
+from heapq import heappush
+from heapq import heappop
 import logging
 from pathlib import Path
 
@@ -291,97 +294,162 @@ def polynomial_schedule(start, end, i, n):
 
 
 class Scope(object):
-    def __init__(self, m_name, m, p_name, p, l, r):
-        self.m_name = m_name
-        self.m = m
-        self.p_name = p_name
-        self.p = p
-        self.l = l
-        self.r = r
-        self.n = r - l
+    def __init__(self, name, module):
+        self.name = name
+        self.module = module
+        self.n_weight = torch.numel(self.weight)
+        self.n_bias = torch.numel(self.bias) if self.has_bias else 0
+        self.n = self.n_weight + self.n_bias
         self.n_zero = 0
-
-    def has(self, index):
-        return self.l <= index and index < self.r
+        self.init_mask()
 
     @property
-    def sparsity(self):
-        return self.n_zero / self.n
+    def weight(self):
+        return self.module.weight
 
+    @weight.setter
+    def weight(self, w):
+        self.module.weight.data = w.reshape(self.module.weight.shape)
 
-class OptimalBrainSurgeon(object):
-    def __init__(self, model, scopes):
-        self.model = model
-        self.scopes = scopes
-        self.init_mask()
-        self.n = len(self.parameters)
-        self.n_zero = 0
-        logging.info(self)
+    def weight_iadd(self, w):
+        self.module.weight.data += w.reshape(self.module.weight.shape)
 
-    ##### Parameter #####
+    @property
+    def has_bias(self):
+        return self.module.bias is not None
+
+    @property
+    def bias(self):
+        return self.module.bias
+
+    @bias.setter
+    def bias(self, b):
+        self.module.bias.data = b.reshape(self.module.bias.shape)
+
+    def bias_iadd(self, b):
+        self.module.bias.data += b.reshape(self.module.bias.shape)
+
     @property
     def parameters(self):
         return self.get_flatten_parameters()
 
     def get_flatten_parameters(self):
-        # TODO(sxwang): Does named_parameters yield in order? We should
-        # guarantee this order is the same as the order in fisher. OrderedDict
-        # looks like ok.
-        return nn.utils.parameters_to_vector([
-            v for k, v in self.model.named_parameters()
-            if k in self.scopes.keys()
-        ])
+        return nn.utils.parameters_to_vector(
+            [self.weight, self.bias] if self.has_bias else [self.weight])
 
     @parameters.setter
     def parameters(self, p):
         self.assign_flatten_parameters(p)
 
     def assign_flatten_parameters(self, p):
-        head = 0
-        for x in self.model.parameters():
-            x.data = p[head:head + torch.numel(x)].reshape(x.shape)
-            head += torch.numel(x)
+        self.weight = p[:self.n_weight]
+        if self.has_bias:
+            self.bias = p[self.n_weight:]
 
     def parameters_iadd(self, p):
-        head = 0
-        for x in self.model.parameters():
-            x.data += p[head:head + torch.numel(x)].reshape(x.shape)
-            head += torch.numel(x)
-
-    ##### Mask #####
-    def mask_name(self, p):
-        return p + "_mask"
+        self.weight_iadd(p[:self.n_weight])
+        if self.has_bias:
+            self.bias_iadd(p[self.n_weight:])
 
     def init_mask(self):
-        for _, v in self.scopes.items():
-            v.m.register_buffer(self.mask_name(v.p_name), torch.ones_like(v.p))
-            # ASDL doesn't use this gradient
-            #v.p.register_hook(
-            #    lambda grad: grad * getattr(v.m, self.mask_name(v.p_name)))
+        self.module.register_buffer("weight_mask",
+                                    torch.ones_like(self.module.weight))
+        self.module.weight.register_hook(
+            lambda grad: grad * getattr(self.module, "weight_mask"))
+        if self.has_bias:
+            self.module.register_buffer("bias_mask",
+                                        torch.ones_like(self.module.bias))
+            self.module.bias.register_hook(
+                lambda grad: grad * getattr(self.module, "bias_mask"))
 
-    def get_mask_by_scope(self, scope):
-        return getattr(scope.m, self.mask_name(scope.p_name))
+    @property
+    def weight_mask(self):
+        return getattr(self.module, "weight_mask")
+
+    @property
+    def bias_mask(self):
+        return getattr(self.module, "bias_mask")
 
     @property
     def mask(self):
         return self.get_flatten_mask()
 
     def get_flatten_mask(self):
-        # TODO(sxwang): Does named_parameters yield in order? We should
-        # guarantee this order is the same as the order in fisher. OrderedDict
-        # looks like ok.
-        return nn.utils.parameters_to_vector([
-            v for k, v in self.model.named_buffers()
-            if k[:-5] in self.scopes.keys()
+        return nn.utils.parameters_to_vector(
+            [self.weight_mask, self.bias_mask] \
+            if self.has_bias else \
+            [self.weight_mask])
+
+    def score(self, diag_fisher_inv):
+        scores = self.parameters.pow(2) / diag_fisher_inv
+        return scores.masked_fill(self.mask == 0.0, float("inf"))
+
+    def prune(self, i, d=None, test=True, log=False):
+        assert i < self.n
+        with torch.no_grad():
+            if d is not None:
+                self.parameters_iadd(d * self.mask)
+            if i < self.n_weight:
+                self.weight.view(-1)[i] = 0.0
+                self.weight_mask.view(-1)[i] = 0.0
+            else:
+                self.bias.view(-1)[i - self.n_weight] = 0.0
+                self.bias_mask.view(-1)[i - self.n_weight] = 0.0
+        self.n_zero += 1
+
+        if test:
+            assert self.parameters[i] == 0.0
+            assert self.mask[i] == 0.0
+            self.check()
+
+        if log:
+            logging.info(self)
+
+    def check(self):
+        masked = self.parameters.masked_select(self.mask < 1)
+        zeros = torch.zeros(self.n_zero).to(masked.device)
+        assert torch.allclose(masked, zeros)
+
+    @property
+    def sparsity(self):
+        return self.n_zero / self.n
+
+    def __str__(self):
+        return "\n".join([
+            #"=" * 80,
+            f"{self.name} sparsity: {self.n_zero}/({self.n_weight}+{self.n_bias})={self.sparsity}",
+            #"parameters:", f"{self.parameters}", "mask:", f"{self.mask}"
         ])
 
-    ##### Scope #####
-    def get_scope_by_index(self, index):
-        for v in self.scopes.values():
-            if v.has(index):
-                return v
 
-    ##### Fisher #####
+class Pair(object):
+    def __init__(self, first, second):
+        self.first = first
+        self.second = second
+
+    def __lt__(self, other):
+        return self.first > other.first
+
+
+class OptimalBrainSurgeon(object):
+    def __init__(self, model, scopes):
+        self.model = model
+        self.scopes = scopes
+        offset = 0
+        for s in self.scopes:
+            s.l = offset
+            s.r = s.l + s.n
+            offset = s.r
+        self.n = sum([s.n for s in self.scopes])
+        self.n_zero = 0
+        logging.info(self)
+
+    def _get_scope_by_indice(self, i):
+        for s in self.scopes:
+            if s.l <= i and i < s.r:
+                return s
+        assert False
+
     def _calc_fisher(self,
                      loader,
                      fisher_type,
@@ -402,32 +470,84 @@ class OptimalBrainSurgeon(object):
                 n_samples -= len(inputs)
                 if n_samples <= 0:
                     break
-        fisher = getattr(self.model, fisher_type)
-        mask = self.mask
-        fisher.data *= mask.reshape([1, -1]) * mask.reshape([-1, 1])
-        fisher.update_inv(damping)
-        return fisher
+        if fisher_shape == SHAPE_FULL:
+            fisher = getattr(self.model, fisher_type)
+            mask = torch.cat([s.mask for s in self.scopes])
+            fisher.data *= mask.reshape([1, -1]) * mask.reshape([-1, 1])
+            fisher.update_inv(damping)
+            return fisher
+        elif fisher_shape == SHAPE_LAYER_WISE:
+            for s in self.scopes:
+                fisher = getattr(s.module, fisher_type)
+                mask = s.mask
+                fisher.data *= mask.reshape([1, -1]) * mask.reshape([-1, 1])
+                fisher.update_inv(damping)
+            return None
+        elif fisher_shape == SHAPE_KRON:
+            return None
+        elif fisher_shape == SHAPE_UNIT_WISE:
+            return None
 
-    ##### Pruning #####
-    def pruning_direction(self, i, fisher):
-        parameters = self.parameters
-        d = -parameters[i] * fisher.inv[:, i] / fisher.inv[i, i]
-        d[i] = -parameters[i]
-        return d
+    def _get_min_indices(self, fisher, fisher_type, fisher_shape, mink=1):
+        if fisher_shape == SHAPE_FULL:
+            parameters = torch.cat([s.parameters for s in self.scopes])
+            mask = torch.cat([s.mask for s in self.scopes])
+            scores = parameters.pow(2) / torch.diagonal(fisher.inv)
+            scores = scores.masked_fill(mask == 0.0, float("inf"))
+            _, indices = torch.sort(scores)
+            return indices[:mink]
+        elif fisher_shape == SHAPE_LAYER_WISE:
+            heap = []
+            for s in self.scopes:
+                fisher = getattr(s.module, fisher_type)
+                scores = s.parameters.pow(2) / torch.diagonal(fisher.inv)
+                scores = scores.masked_fill(s.mask == 0.0, float("inf"))
+                scores, indices = torch.sort(scores)
+                for i in range(min(mink, len(scores))):
+                    if scores[i] == float("inf"):
+                        break
+                    if len(heap) >= mink:
+                        if heap[0].first <= scores[i]:
+                            break
+                        else:
+                            heappop(heap)
+                    heappush(heap, Pair(scores[i], s.l + indices[i]))
+            return [x.second for x in heap]
+        elif fisher_shape == SHAPE_KRON:
+            return None
+        elif fisher_shape == SHAPE_UNIT_WISE:
+            return None
 
-    def prune_one(self, i, fisher):
-        scope = self.get_scope_by_index(i)
-        self.get_mask_by_scope(scope).view(-1)[i - scope.l] = 0.0
-        scope.n_zero += 1
+    def _pruning_direction(self, i, fisher, fisher_type, fisher_shape):
+        s = self._get_scope_by_indice(i)
+        j = i - s.l
+        pj = s.parameters[j]
+        if fisher_shape == SHAPE_FULL:
+            return [
+                -pj * fisher.inv[s.l:s.r, i] / fisher.inv[i, i] * s.mask
+                for s in self.scopes
+            ]
+        elif fisher_shape == SHAPE_LAYER_WISE:
+            fisher = getattr(s.module, fisher_type)
+            d = -pj * fisher.inv[:, j] / fisher.inv[j, j] * s.mask
+            return [d if s.l <= i and i < s.r else None for s in self.scopes]
+        elif fisher_shape == SHAPE_KRON:
+            return None
+        elif fisher_shape == SHAPE_UNIT_WISE:
+            return None
 
-        self.parameters_iadd(self.pruning_direction(i, fisher))
+    def _prune_one(self, i, fisher, fisher_type, fisher_shape, cb):
+        ds = self._pruning_direction(i, fisher, fisher_type, fisher_shape)
+        for d, s in zip(ds, self.scopes):
+            if d is not None:
+                s.parameters_iadd(d)
+
+        scope = self._get_scope_by_indice(i)
+        scope.prune(i - scope.l, log=False)
+
         self.n_zero += 1
-
-        mask = self.mask
-        torch.isclose(mask[i], torch.tensor([0.0]).to(mask.device))
-        parameters = self.parameters
-        torch.allclose(parameters.masked_select(mask < 1),
-                       torch.zeros(self.n_zero).to(mask.device))
+        if cb is not None:
+            cb(self.n_zero, self.model)
 
     def prune(self,
               loader,
@@ -438,12 +558,6 @@ class OptimalBrainSurgeon(object):
               n_recompute=1,
               n_recompute_samples=4096,
               cb=None):
-        #fisher_for_cross_entropy(self.model,
-        #                         fisher_type=self.fisher_type,
-        #                         fisher_shapes=self.fisher_shapes,
-        #                         data_loader=loader)
-        #fisher = getattr(self.model, self.fisher_type)
-
         init_n_zero = self.n_zero
         target_n_zero = int(self.n * sparsity)
 
@@ -455,20 +569,16 @@ class OptimalBrainSurgeon(object):
                 init_n_zero, target_n_zero, i, n_recompute)
 
         for i in range(1, n_recompute + 1):
-            n_pruned = int(schedule(i)) - self.n_zero
-
+            # We are accumulating fisher across recompute iteration
+            # Should we clear fisher at beginning of the iteration?
             fisher = self._calc_fisher(loader, fisher_type, fisher_shape,
                                        n_recompute_samples, damping)
-
-            scores = self.parameters.pow(2) / torch.diagonal(fisher.inv)
-            scores -= scores.max() + 1
-            scores *= self.mask
-            _, indices = torch.sort(scores)
-
-            for j in range(n_pruned):
-                self.prune_one(indices[j].item(), fisher)
-                if cb is not None:
-                    cb(self.n_zero, self.model)
+            with torch.no_grad():
+                n_pruned = int(schedule(i)) - self.n_zero
+                indices = self._get_min_indices(fisher, fisher_type,
+                                                fisher_shape, n_pruned)
+                for j in indices:
+                    self._prune_one(j, fisher, fisher_type, fisher_shape, cb)
 
         logging.info(self)
 
@@ -477,13 +587,7 @@ class OptimalBrainSurgeon(object):
         return self.n_zero / self.n
 
     def __str__(self):
-        info = ["Pruning Scope:"]
-        fmt = "{:<15} {:<5} {:<5} {:<5} {:<5} {:<5}"
-        info += [fmt.format("parameter", "l", "r", "n", "zero", "sparsity")]
-        info += [
-            fmt.format(k, v.l, v.r, v.n, v.n_zero, v.sparsity)
-            for k, v in self.scopes.items()
-        ]
+        info = [str(s) for s in self.scopes]
         info += [f"Total sparsity: {self.n_zero}/{self.n}={self.sparsity}"]
         return "\n".join(info)
 
@@ -502,15 +606,7 @@ def list_model(module, prefix="", condition=lambda _: True):
 
 def get_global_prnning_scope(model):
     modules = list_model(model, condition=lambda x: hasattr(x, "weight"))
-    scopes = {}
-    l = 0
-    for m_name, m in modules.items():
-        for p_name, p in m.named_parameters():
-            r = l + torch.numel(p)
-            scopes[f"{m_name}.{p_name}"] = Scope(m_name, m, p_name, p, l, r)
-            l = r
-    return scopes
-    #return {k: v for k, v in model.named_parameters()}
+    return [Scope(k, v) for k, v in modules.items()]
 
 
 def one_shot_pruning(model, loaders, criterion, args):
