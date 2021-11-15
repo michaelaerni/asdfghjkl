@@ -1,10 +1,10 @@
-#!/bin/bash 
+#!/bin/bash
 
 # yrun any_1
 # ybatch yokota-job
 
 #SBATCH -J prunning
-#YBATCH -r psti_1
+#YBATCH -r am_1
 #SBATCH -N 1
 #SBATCH -o .log/log
 
@@ -15,4 +15,6 @@ module load cudnn
 source $HOME/vir/py3/bin/activate
 export PYTHONPATH=$PYTHONPATH:$HOME/asdfghjkl
 
-python pruning.py --no-pretrain --device=cuda --model=toy2 --e=50 --lr=0.001 --batch=256
+wandb agent cecilwang/pruning/yfkhz0va
+#wandb agent cecilwang/pruning/epv0er2u
+#python pruning.py --no-pretrain --device=cuda --model=toy2 --e=50 --lr=0.001 --batch=256
