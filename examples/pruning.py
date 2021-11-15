@@ -19,6 +19,7 @@ import asdfghjkl as asdl
 from asdfghjkl import fisher_for_cross_entropy
 from asdfghjkl import FISHER_EXACT, FISHER_MC, FISHER_EMP
 from asdfghjkl import SHAPE_FULL, SHAPE_LAYER_WISE, SHAPE_KRON, SHAPE_DIAG
+from asdfghjkl.utils import add_value_to_diagonal, cholesky_inv
 
 
 def parse_args():
@@ -460,12 +461,14 @@ class OptimalBrainSurgeon(object):
             if n_samples != -1 and len(inputs) > n_samples:
                 inputs = inputs[:n_samples]
                 targets = targets[:n_samples]
-            fisher_for_cross_entropy(self.model,
-                                     fisher_type=fisher_type,
-                                     fisher_shapes=[fisher_shape],
-                                     inputs=inputs,
-                                     targets=targets,
-                                     accumulate=True)
+            fisher_for_cross_entropy(
+                self.model,
+                fisher_type=fisher_type,
+                #fisher_shapes=[fisher_shape, SHAPE_LAYER_WISE],
+                fisher_shapes=[fisher_shape],
+                inputs=inputs,
+                targets=targets,
+                accumulate=True)
             if n_samples != -1:
                 n_samples -= len(inputs)
                 if n_samples <= 0:
@@ -484,6 +487,24 @@ class OptimalBrainSurgeon(object):
                 fisher.update_inv(damping)
             return None
         elif fisher_shape == SHAPE_KRON:
+            for s in self.scopes:
+                fisher = getattr(s.module, fisher_type).kron
+                mask = s.mask
+                f = torch.kron(fisher.A, fisher.B)
+                f *= mask.reshape([1, -1]) * mask.reshape([-1, 1])
+                fisher.inv = cholesky_inv(add_value_to_diagonal(f, damping))
+                #print(f)
+                #print(fisher.inv)
+
+                #fisher = getattr(s.module, fisher_type)
+                #mask = s.mask
+                #fisher.data *= mask.reshape([1, -1]) * mask.reshape([-1, 1])
+                #fisher.update_inv(damping)
+                #print("*" * 20)
+                #print(fisher.data)
+                #print(fisher.inv)
+                #print("=" * 20)
+
             return None
         elif fisher_shape == SHAPE_UNIT_WISE:
             return None
@@ -496,10 +517,12 @@ class OptimalBrainSurgeon(object):
             scores = scores.masked_fill(mask == 0.0, float("inf"))
             _, indices = torch.sort(scores)
             return indices[:mink]
-        elif fisher_shape == SHAPE_LAYER_WISE:
+        elif fisher_shape in [SHAPE_LAYER_WISE, SHAPE_KRON]:
             heap = []
             for s in self.scopes:
                 fisher = getattr(s.module, fisher_type)
+                if fisher_shape == SHAPE_KRON:
+                    fisher = fisher.kron
                 scores = s.parameters.pow(2) / torch.diagonal(fisher.inv)
                 scores = scores.masked_fill(s.mask == 0.0, float("inf"))
                 scores, indices = torch.sort(scores)
@@ -513,8 +536,6 @@ class OptimalBrainSurgeon(object):
                             heappop(heap)
                     heappush(heap, Pair(scores[i], s.l + indices[i]))
             return [x.second for x in heap]
-        elif fisher_shape == SHAPE_KRON:
-            return None
         elif fisher_shape == SHAPE_UNIT_WISE:
             return None
 
@@ -527,12 +548,12 @@ class OptimalBrainSurgeon(object):
                 -pj * fisher.inv[s.l:s.r, i] / fisher.inv[i, i] * s.mask
                 for s in self.scopes
             ]
-        elif fisher_shape == SHAPE_LAYER_WISE:
+        elif fisher_shape in [SHAPE_LAYER_WISE, SHAPE_KRON]:
             fisher = getattr(s.module, fisher_type)
+            if fisher_shape == SHAPE_KRON:
+                fisher = fisher.kron
             d = -pj * fisher.inv[:, j] / fisher.inv[j, j] * s.mask
             return [d if s.l <= i and i < s.r else None for s in self.scopes]
-        elif fisher_shape == SHAPE_KRON:
-            return None
         elif fisher_shape == SHAPE_UNIT_WISE:
             return None
 
