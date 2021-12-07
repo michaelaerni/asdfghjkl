@@ -1,9 +1,6 @@
 import argparse
 import copy
 #from functools import reduce
-#from heapq import heapify
-from heapq import heappush
-from heapq import heappop
 import logging
 from pathlib import Path
 
@@ -62,7 +59,7 @@ def parse_args():
                         default="full",
                         choices=["full", "layer_wise", "kron", "unit_wise"])
     parser.add_argument("--sparsity", type=float, default=1.0)
-    parser.add_argument("--damping", type=float, default=1e-3)
+    parser.add_argument("--damping", type=float, default=1e-4)
     parser.add_argument("--n_recompute", type=int, default=10)
     parser.add_argument("--n_recompute_samples", type=int, default=4096)
     parser.add_argument("--test_intvl", type=float, default=0.05)
@@ -289,7 +286,7 @@ def pretrain(model, loaders, opt, criterion, args):
 
 def polynomial_schedule(start, end, i, n):
     scale = end - start
-    progress = min(i / n, 1.0)
+    progress = min(float(i) / n, 1.0)
     remaining_progress = (1.0 - progress)**2
     return end - scale * remaining_progress
 
@@ -468,7 +465,7 @@ class OptimalBrainSurgeon(object):
                 fisher_shapes=[fisher_shape],
                 inputs=inputs,
                 targets=targets,
-                accumulate=True)
+                accumulate=False)
             if n_samples != -1:
                 n_samples -= len(inputs)
                 if n_samples <= 0:
@@ -518,24 +515,22 @@ class OptimalBrainSurgeon(object):
             _, indices = torch.sort(scores)
             return indices[:mink]
         elif fisher_shape in [SHAPE_LAYER_WISE, SHAPE_KRON]:
-            heap = []
+            pairs = []
             for s in self.scopes:
                 fisher = getattr(s.module, fisher_type)
                 if fisher_shape == SHAPE_KRON:
                     fisher = fisher.kron
                 scores = s.parameters.pow(2) / torch.diagonal(fisher.inv)
+                #if fisher_shape == SHAPE_KRON:
+                #    scores /= torch.sum(scores)
                 scores = scores.masked_fill(s.mask == 0.0, float("inf"))
                 scores, indices = torch.sort(scores)
                 for i in range(min(mink, len(scores))):
                     if scores[i] == float("inf"):
                         break
-                    if len(heap) >= mink:
-                        if heap[0].first <= scores[i]:
-                            break
-                        else:
-                            heappop(heap)
-                    heappush(heap, Pair(scores[i], s.l + indices[i]))
-            return [x.second for x in heap]
+                    pairs.append((scores[i], s.l + indices[i]))
+            pairs.sort()
+            return [x[1] for x in pairs[:mink]]
         elif fisher_shape == SHAPE_UNIT_WISE:
             return None
 
