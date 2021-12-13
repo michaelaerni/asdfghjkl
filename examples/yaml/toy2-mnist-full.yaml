@@ -10,7 +10,7 @@ parameters:
   pruning_strategy:
     values: ['oneshot']
   fisher_type:
-    values: ['fisher_emp']
+    values: ['fisher_emp', 'wood_fisher']
   fisher_shape:
     values: ['full']
   n_recompute:
