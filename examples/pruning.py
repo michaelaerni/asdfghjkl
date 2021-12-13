@@ -83,7 +83,8 @@ def parse_args():
 
     args.model_dir = f"{args.log}/{args.model}-{args.dataset}"
     args.log = f"{args.log}/{args.model}-{args.dataset}/" \
-               f"{args.pruning_strategy}/{args.fisher_shape}/" \
+               f"{args.pruning_strategy}/" \
+               f"{args.fisher_type}/{args.fisher_shape}/" \
                f"{args.n_recompute}-{args.n_recompute_samples}"
     Path(args.log).mkdir(parents=True, exist_ok=True)
 
