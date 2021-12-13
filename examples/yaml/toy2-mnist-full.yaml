@@ -16,4 +16,4 @@ parameters:
   n_recompute:
     values: [-1, 2, 4, 10, 50, 100]
   n_recompute_samples:
-    values: [-1, 100, 1024, 4096, 10240]
+    values: [-1, 128, 1024, 4096, 10240]

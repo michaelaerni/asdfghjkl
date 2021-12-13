@@ -15,7 +15,5 @@ module load cudnn
 source $HOME/vir/py3/bin/activate
 export PYTHONPATH=$PYTHONPATH:$HOME/asdfghjkl
 
-wandb agent cecilwang/pruning/kdgmtnrs
-wandb agent cecilwang/pruning/wft1jqd9
-wandb agent cecilwang/pruning/g98hwuen
+wandb agent cecilwang/pruning/udpkzcuc
 #python pruning.py --no-pretrain --device=cuda --model=toy2 --e=50 --lr=0.001 --batch=256

@@ -61,14 +61,8 @@ def parse_args():
         type=str,
         default="full",
         choices=["full", "layer_wise", "kron", "unit_wise", "none"])
-    parser.add_argument("--kfac_fast_inv",
-                        dest="kfac_fast_inv",
-                        action="store_true")
-    parser.set_defaults(kfac_fast_inv=False)
-    parser.add_argument("--layer_normalize",
-                        dest="layer_normalize",
-                        action="store_true")
-    parser.set_defaults(layer_normalize=False)
+    parser.add_argument("--layer_normalize", type=bool, default=False)
+    parser.add_argument("--kfac_fast_inv", type=bool, default=False)
 
     parser.add_argument("--check", dest="check", action="store_true")
     parser.set_defaults(check=False)
