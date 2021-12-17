@@ -59,13 +59,13 @@ def data_loader_gradient(
     return total_loss
 
 
-def batch_gradient(model, loss_fn, inputs, targets):
+def batch_gradient(model, loss_fn, inputs, targets, retain_graph=False):
     n = len(inputs)
     with extend(model, OP_BATCH_GRADS) as ctx:
         model.zero_grad()
         f = model(inputs)
         loss = loss_fn(f, targets)
-        loss.backward()
+        loss.backward(retain_graph=retain_graph)
         batch_grad_list = _get_batch_grad_list(model, ctx)
         grads = torch.cat([g.view(n, -1) for g in batch_grad_list], dim=1)  # (n, p)
     return grads, f
