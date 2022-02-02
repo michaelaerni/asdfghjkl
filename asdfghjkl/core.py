@@ -16,7 +16,12 @@ def extend(model, *op_names, map_rule=None, vectors: ParamVector = None):
 
     try:
         def forward_hook(module, in_data, out_data):
-            in_data = in_data[0].clone().detach()
+            in_data = in_data[0]
+            # TODO: This is quite a hack to get a differentiable Laplace predictive
+            #  (needs to calculate derivatives w.r.t. the inputs through the Jacobians)
+            #  Might have unintended side-effects.
+            if OP_BATCH_GRADS not in op_names:
+                in_data = in_data.clone().detach()
             in_data = _preprocess_in_data(module, in_data, out_data)
             manager.call_operations_in_forward(module, in_data, out_data)
 
