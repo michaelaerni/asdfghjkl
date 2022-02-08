@@ -65,8 +65,11 @@ def batch_gradient(model, loss_fn, inputs, targets, create_graph=False):
         model.zero_grad()
         f = model(inputs)
         loss = loss_fn(f, targets)
-        # TODO: This might create a reference cycle and memory leak, investigate!
-        loss.backward(create_graph=create_graph)
+        # Use grad, instead of backward
+        # First, since the actual gradients are uninteresting, this saves some memory
+        # Second, this also avoids dependency cycles when taking higher-order derivatives
+        #  (i.e., create_graph is True)
+        torch.autograd.grad(loss, tuple(model.parameters()), create_graph=create_graph)
         batch_grad_list = _get_batch_grad_list(model, ctx)
         grads = torch.cat([g.view(n, -1) for g in batch_grad_list], dim=1)  # (n, p)
     return grads, f
