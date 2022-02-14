@@ -26,7 +26,9 @@ def extend(model, *op_names, map_rule=None, vectors: ParamVector = None):
             manager.call_operations_in_forward(module, in_data, out_data)
 
             def backward_hook(out_grads):
-                out_grads = out_grads.clone().detach()
+                # TODO: Same hack as above in the forward hook!
+                if OP_BATCH_GRADS not in op_names:
+                    out_grads = out_grads.clone().detach()
                 out_grads = _preprocess_out_grads(module, out_grads)
                 manager.call_operations_in_backward(module, in_data, out_grads)
 
